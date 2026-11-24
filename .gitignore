@@ -1,0 +1,17 @@
+build/
+dist/
+
+# Signing material never belongs in a repo
+*.p8
+*.p12
+*.cer
+*.pem
+*.key
+*.certSigningRequest
+*.mobileprovision
+*.provisionprofile
+.env
+.env.*
+
+.DS_Store
+.claude/
