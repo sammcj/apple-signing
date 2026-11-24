@@ -1,5 +1,6 @@
 build/
 dist/
+__pycache__/
 
 # Signing material never belongs in a repo
 *.p8
