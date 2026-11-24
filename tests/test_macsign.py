@@ -8,9 +8,11 @@ import json
 import os
 import plistlib
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from typing import Any
@@ -50,6 +52,7 @@ class FakeShell(Shell):
         return subprocess.CompletedProcess(line, 0, "", "")
 
     def run_live(self, *cmd: macsign.Arg, interactive: bool = False) -> bool:
+        self.interactive = interactive
         return self.read(*cmd).returncode == 0
 
     def run_json(self, *cmd: macsign.Arg) -> dict[str, Any]:
@@ -67,8 +70,17 @@ class TempDirCase(unittest.TestCase):
         self.addCleanup(folder.cleanup)
         self.dir = Path(folder.name).resolve()
         environment = {k: v for k, v in os.environ.items() if not k.startswith(("APPLE_", "DEVELOPER_ID", "SIGN_"))}
-        # A service that does not exist, so tests never read the developer's own Keychain items.
-        environment["KEYCHAIN_SERVICE"] = "macsign-tests"
+        # Tests never reach the developer's own Keychain, whatever the code under test does. FakeShell answers lookups.
+        real_read = Shell.read
+
+        def guarded(sh: Shell, *cmd: macsign.Arg, stdin: str = "") -> subprocess.CompletedProcess[str]:
+            if cmd[0] == "security":
+                return subprocess.CompletedProcess("", 44, "", "")
+            return real_read(sh, *cmd, stdin=stdin)
+
+        guard = mock.patch.object(Shell, "read", guarded)
+        guard.start()
+        self.addCleanup(guard.stop)
         patch = mock.patch.dict(os.environ, environment, clear=True)
         patch.start()
         self.addCleanup(patch.stop)
@@ -135,6 +147,25 @@ class IdentityTests(unittest.TestCase):
     def test_an_exact_name_beats_a_longer_one(self) -> None:
         longer = Identity("D" * 40, RELEASE.name + " Extra")
         self.assertEqual(macsign.choose_identity([longer, RELEASE], RELEASE.name), RELEASE)
+
+    @mock.patch.dict(os.environ, clear=True)
+    def test_development_identity_order(self) -> None:
+        other = Identity("D" * 40, DEVELOPMENT.name)
+        stored = ("-a dev-signing-identity -w", 0, other.sha1 + "\n", "")
+        sh = FakeShell(("find-identity", 0, find_identity_output(RELEASE, DEVELOPMENT, other), ""), stored)
+        self.assertEqual(macsign.development_identity(sh, None), other)
+        with mock.patch.dict(os.environ, {"SIGN_IDENTITY": RELEASE.sha1}):
+            self.assertEqual(macsign.development_identity(sh, None), RELEASE)
+        with mock.patch.dict(os.environ, {"SIGN_IDENTITY": "-"}):
+            self.assertEqual(macsign.development_identity(sh, None), AD_HOC)
+
+    @mock.patch.dict(os.environ, clear=True)
+    def test_several_development_identities_fall_back_to_ad_hoc(self) -> None:
+        other = Identity("D" * 40, DEVELOPMENT.name)
+        sh = FakeShell(("find-identity", 0, find_identity_output(DEVELOPMENT, other), ""))
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(macsign.development_identity(sh, None), AD_HOC)
+        self.assertIn("ad-hoc", output.getvalue())
 
     @mock.patch.dict(os.environ, clear=True)
     def test_release_refuses_other_kinds_and_ad_hoc(self) -> None:
@@ -223,6 +254,12 @@ class BundleTests(TempDirCase):
             with self.subTest(f"{original} {folder}"), self.assertRaisesRegex(Failure, "overlap"):
                 macsign.stage(sh, App(original, original), folder)
             self.assertEqual(sh.commands, [])
+
+    def test_staging_drops_files_of_an_earlier_copy(self) -> None:
+        app = self.bundle("A.app")
+        stale = self.write("s/A.app/Contents/Resources/stale")
+        macsign.stage(Shell(), App(app, app), self.dir / "s")
+        self.assertFalse(stale.exists())
 
     def test_staging_refuses_the_original_by_another_name(self) -> None:
         app = self.bundle("build/A.app")
@@ -462,6 +499,22 @@ class NotariseTests(TempDirCase):
         self.assertEqual(self.auth(sh=sh)[:2], ["--key-id", "STOREDKEY1"])
         self.assertNotIn("api-key-file -w", " ".join(sh.commands))
 
+    def test_options_replace_parts_of_the_stored_key(self) -> None:
+        auth = self.auth("--issuer", "I", sh=self.stored_key())
+        self.assertEqual([auth[1], auth[-1]], ["STOREDKEY1", "I"])
+        self.assertEqual(self.auth("--key", "mine.p8", sh=self.stored_key())[3], "mine.p8")
+
+    def test_locked_keychain_is_not_reported_as_a_bad_key(self) -> None:
+        sh = FakeShell(("-a api-key-file -w", 36, "", "locked"), ("-a api-key", 0, "K", ""))
+        with self.assertRaisesRegex(Failure, "locked"):
+            self.auth(sh=sh)
+
+    def test_key_and_issuer_ids_are_not_printed(self) -> None:
+        Shell(dry_run=True).run("xcrun", "notarytool", "--key-id", "SECRETISH", "--issuer", "UUID", "a b")
+        self.assertIn("--key-id *** --issuer ***", self.output.getvalue())
+        self.assertNotIn("SECRETISH", self.output.getvalue())
+        self.assertNotIn("UUID", self.output.getvalue())
+
     def test_options_beat_the_stored_key(self) -> None:
         self.assertEqual(self.auth("--keychain-profile", "p", sh=self.stored_key()), ["--keychain-profile", "p"])
         self.assertEqual(self.auth("--key", "k", "--key-id", "K", sh=self.stored_key())[1], "K")
@@ -494,6 +547,16 @@ class CheckTests(TempDirCase):
             sh = FakeShell((rejected, 1, "", "rejected"), ("-dvv", 0, "", "Executable=/A\n" + good))
             with self.subTest(rejected), self.assertRaises(Failure):
                 macsign.verify(sh, App(app, app), dmg, None)
+
+    def test_homebrew_libraries_and_dmg_signature_fail(self) -> None:
+        app, dmg = self.bundle("A.app"), self.write("A.dmg")
+        for answer in (
+            ("otool", 0, "x:\n\t/opt/homebrew/lib/liba.dylib (c)\n", ""),
+            ("otool", 1, "", "bad file"),
+            (f"codesign --verify --strict {dmg}", 1, "", "unsigned"),
+        ):
+            with self.subTest(answer), self.assertRaises(Failure):
+                macsign.verify(FakeShell(answer), App(app, app), dmg, None)
 
     def test_ready(self) -> None:
         sh = FakeShell(("find-identity", 0, find_identity_output(RELEASE), ""))
@@ -603,11 +666,15 @@ class CommandTests(TempDirCase):
         args = argparse.Namespace(key=None, key_id="K", issuer=None, keychain_profile=None, identity=None)
         macsign.cmd_setup(sh, args)
         self.assertEqual(sh.commands[-1], "xcrun notarytool store-credentials apple-release --key-id K")
+        self.assertTrue(sh.interactive)
 
     def test_setup_has_nothing_to_do_with_a_stored_key(self) -> None:
         sh = FakeShell(("find-generic-password", 0, "", ""))
         macsign.cmd_setup(sh, macsign.build_parser().parse_args(["setup"]))
         self.assertNotIn("store-credentials", " ".join(sh.commands))
+        self.assertIn("security delete-generic-password", self.output.getvalue())
+        with self.assertRaisesRegex(Failure, "already stored"):
+            macsign.cmd_setup(sh, macsign.build_parser().parse_args(["setup", "--key-id", "K"]))
 
     def test_setup_saves_an_identity_that_is_then_used(self) -> None:
         sh = FakeShell(("find-identity", 0, find_identity_output(RELEASE, RENEWED, DEVELOPMENT), ""))
@@ -619,6 +686,42 @@ class CommandTests(TempDirCase):
             ("-a signing-identity -w", 0, RENEWED.sha1 + "\n", ""),
         )
         self.assertEqual(macsign.release_identity(sh, None), RENEWED)
+
+    def test_dmg_refuses_an_app_that_is_not_developer_id_signed(self) -> None:
+        sh = FakeShell()
+        with mock.patch.object(macsign, "Shell", return_value=sh):
+            self.assertEqual(macsign.main(["dmg", str(self.bundle("A.app"))]), 1)
+        self.assertNotIn("hdiutil", " ".join(sh.commands))
+
+    def test_history_shows_the_log_of_one(self) -> None:
+        sh = FakeShell()
+        macsign.cmd_history(sh, macsign.build_parser().parse_args(["history", "ID-1"]))
+        self.assertIn("notarytool log ID-1", sh.commands[-1])
+
+    def test_termination_cleans_up(self) -> None:
+        def terminate(sh: Shell, args: argparse.Namespace) -> None:
+            os.kill(os.getpid(), signal.SIGTERM)
+            time.sleep(0.2)
+
+        previous = signal.getsignal(signal.SIGTERM)
+        self.addCleanup(signal.signal, signal.SIGTERM, previous)
+        with mock.patch.object(macsign, "cmd_history", terminate), self.assertRaises(SystemExit) as stopped:
+            macsign.main(["history"])
+        self.assertEqual(stopped.exception.code, 143)
+
+    def test_dmg_is_detached_when_interrupted(self) -> None:
+        app = self.bundle("A.app")
+
+        class InterruptedShell(FakeShell):
+            def read(self, *cmd: macsign.Arg, stdin: str = "") -> subprocess.CompletedProcess[str]:
+                if cmd[0] == "ditto":
+                    raise KeyboardInterrupt
+                return super().read(*cmd, stdin=stdin)
+
+        sh = InterruptedShell()
+        with self.assertRaises(KeyboardInterrupt):
+            macsign.create_dmg(sh, App(app, app), self.dir / "A.dmg", RELEASE)
+        self.assertIn("detach -force", sh.commands[-1])
 
     def test_commands_cannot_wait_for_input(self) -> None:
         with mock.patch("subprocess.run") as run:

@@ -27,7 +27,7 @@ The result is `dist/<name>-<version>.dmg`. The app is copied to `build/signing` 
 - `sign`: development sign (ad-hoc without a certificate), or Developer ID with `--release`
 - `install`: development sign, then replace the copy in `/Applications`
 - `notarise`: Developer ID sign, notarise and staple the app
-- `dmg`: package a signed app into a notarised, stapled DMG
+- `dmg`: package an app that is already Developer ID signed, such as `build/signing/MyApp.app`, into a notarised, stapled DMG
 - `release`: `check`, `notarise`, `dmg` and `verify`
 - `verify`: check signatures, hardened runtime, entitlements, Gatekeeper and staples
 - `history`: list submissions to Apple, or show the log of one
@@ -93,7 +93,7 @@ For CI, an API key can be given as `--key`, `--key-id` and `--issuer`, or `APPLE
 Copy `macsign.py` into it, or run a tagged version without copying:
 
 ```bash
-uvx --from git+https://github.com/sammcj/apple-signing@<tag> macsign release path/to/MyApp.app
+uvx --from git+https://github.com/sammcj/apple-signing@<tag or commit> macsign release path/to/MyApp.app
 ```
 
 Build the app however you do now, then call it from your Makefile or CI:
@@ -130,7 +130,7 @@ Bundle contents:
 | `errSecInternalComponent`                | The keychain is locked, usual over SSH. Run `security unlock-keychain`                                                                                      |
 | Notarisation `Invalid`                   | The log printed under it names each file. Usually an unsigned nested binary or a `get-task-allow` debug entitlement                                         |
 | Notarisation stuck in progress           | A new team's first submissions can take hours or longer. `history` shows the state, `history ID` the log once done. Run `release` again once it clears                |
-| Notarisation 401                         | Wrong issuer or key ID, or an issuer given for an Individual key. Run `setup` again                                                                         |
+| Notarisation 401                         | Wrong issuer or key ID, or an issuer given for an Individual key. `setup` replaces them                                                                         |
 | Notarisation 403 mentioning an agreement | The Account Holder must accept the new terms at [developer.apple.com/account](https://developer.apple.com/account)                                          |
 | Crashes only when signed                 | Hardened runtime. Check Console, then add the one entitlement it needs                                                                                      |
 | Library refused, different Team IDs      | A nested library was not re-signed, or is loaded from outside the app                                                                                       |

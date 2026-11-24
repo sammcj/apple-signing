@@ -54,7 +54,10 @@ class Shell:
         self.dry_run = dry_run
 
     def announce(self, cmd: tuple[Arg, ...]) -> None:
-        print(f"+ {shlex.join(map(str, cmd))}", file=sys.stderr, flush=True)
+        # Not secret, but they identify the account and CI logs can be public.
+        hidden = ("--key-id", "--issuer")
+        words = ["***" if n and cmd[n - 1] in hidden else str(word) for n, word in enumerate(cmd)]
+        print(f"+ {' '.join(w if w == '***' else shlex.quote(w) for w in words)}", file=sys.stderr, flush=True)
 
     def report(self, message: str) -> None:
         """Say that something happened, which in a dry run it did not."""
@@ -185,7 +188,11 @@ def development_identity(sh: Shell, wanted: str | None) -> Identity:
         return AD_HOC
     identities = installed_identities(sh)
     if not wanted:
-        return choose_identity(identities, None, APPLE_DEVELOPMENT) or AD_HOC
+        try:
+            return choose_identity(identities, None, APPLE_DEVELOPMENT) or AD_HOC
+        except Failure as e:
+            say(f"Falling back to ad-hoc signing: {e}")
+            return AD_HOC
     identity = choose_identity(identities, wanted)
     if not identity:
         raise Failure(f"no identity matching '{wanted}' in the Keychain")
@@ -385,24 +392,26 @@ def has_stored_api_key(sh: Shell) -> bool:
 def notary_auth(sh: Shell, args: argparse.Namespace) -> Generator[list[str], None, None]:
     """notarytool's credential options.
 
-    In order: an explicit profile, an API key from the options, an API key in Keychain items, the default profile.
+    In order: an explicit profile, an API key from the options, an API key in Keychain items (any part of which the
+    options can replace), the default profile.
     """
     if args.keychain_profile:
         yield ["--keychain-profile", args.keychain_profile]
-    elif args.key or args.key_id or args.issuer:
-        if not (args.key and args.key_id):
-            raise Failure(
-                "an API key needs --key and --key-id (APPLE_API_KEY_PATH and APPLE_API_KEY), plus --issuer for a Team "
-                "key. To use stored credentials with those variables set, pass --keychain-profile"
-            )
+    elif args.key and args.key_id:
         yield api_key_options(args.key_id, args.key, args.issuer)
     elif has_stored_api_key(sh):
         # notarytool only reads an API key from a file. This one is in a directory only this user can read.
         with tempfile.TemporaryDirectory() as work:
-            path = Path(work, "AuthKey.p8")
-            if not sh.dry_run:
-                path.write_bytes(decode_api_key(keychain_item(sh, "api-key-file")))
-            yield api_key_options(keychain_item(sh, "api-key"), path, keychain_item(sh, "api-issuer"))
+            key = args.key or Path(work, "AuthKey.p8")
+            if not args.key and not sh.dry_run:
+                key.write_bytes(decode_api_key(keychain_item(sh, "api-key-file")))
+            key_id = args.key_id or keychain_item(sh, "api-key")
+            yield api_key_options(key_id, key, args.issuer or keychain_item(sh, "api-issuer"))
+    elif args.key or args.key_id or args.issuer:
+        raise Failure(
+            "an API key needs --key and --key-id (APPLE_API_KEY_PATH and APPLE_API_KEY), plus --issuer for a Team "
+            "key. To use stored credentials with those variables set, pass --keychain-profile"
+        )
     else:
         yield ["--keychain-profile", DEFAULT_KEYCHAIN_PROFILE]
 
@@ -413,6 +422,11 @@ def api_key_options(key_id: str, key: Path, issuer: str | None) -> list[str]:
 
 
 def decode_api_key(value: str) -> bytes:
+    if not value:
+        raise Failure(
+            f"cannot read the Keychain item {keychain_service()}/api-key-file. If the keychain is locked, run: "
+            "security unlock-keychain"
+        )
     try:
         key = base64.b64decode(value, validate=True)
     except ValueError:
@@ -538,7 +552,7 @@ def check(sh: Shell, wanted: str | None, auth: list[str]) -> None:
     except Failure as e:
         report.fail(str(e))
     # Catches a wrong ID, a revoked key and an unsigned agreement.
-    label = f"Apple accepts the credentials ({' '.join(auth[:2])})"
+    label = f"Apple accepts the credentials ({auth[1] if auth[0] == '--keychain-profile' else 'API key'})"
     report.command(label, sh.read("xcrun", "notarytool", "history", *auth))
     report.finish("not ready to release. The setup command stores missing credentials")
 
@@ -638,8 +652,14 @@ def cmd_setup(sh: Shell, args: argparse.Namespace) -> None:
         return
     if not args.keychain_profile and has_stored_api_key(sh):
         service = keychain_service()
-        say(f"Nothing to do: the API key in the Keychain items of '{service}' is used. Next: check")
-        say(f"To replace it, delete the items api-issuer, api-key and api-key-file of '{service}' and run setup again")
+        items = ("api-key-file", "api-key", "api-issuer")
+        replace = "\n".join(f"  security delete-generic-password -s {shlex.quote(service)} -a {i}" for i in items)
+        message = (
+            f"an API key is already stored in the Keychain items of '{service}'. To replace it, delete them:\n{replace}"
+        )
+        if args.key or args.key_id or args.issuer:
+            raise Failure(message)
+        say(f"Nothing to do, {message}")
         return
     given = {"--key": args.key, "--key-id": args.key_id, "--issuer": args.issuer}
     options = [word for option, value in given.items() if value for word in (option, value)]
@@ -719,8 +739,11 @@ def cmd_notarise(sh: Shell, args: argparse.Namespace) -> None:
 
 
 def cmd_dmg(sh: Shell, args: argparse.Namespace) -> None:
+    app = open_app(args.app)
+    if not sh.dry_run and not signature_of(sh, app.path).developer_id:
+        raise Failure(f"{app.path} is not Developer ID signed, so Apple would reject the DMG. Use release instead")
     with notary_auth(sh, args) as auth:
-        package(sh, open_app(args.app), args, auth)
+        package(sh, app, args, auth)
 
 
 def cmd_release(sh: Shell, args: argparse.Namespace) -> None:
@@ -752,13 +775,6 @@ def any_path(value: str) -> Path:
     return Path(value).expanduser()
 
 
-def existing_path(value: str) -> Path:
-    path = any_path(value)
-    if not path.exists():
-        raise argparse.ArgumentTypeError(f"{value} not found")
-    return path
-
-
 def existing_file(value: str) -> Path:
     path = any_path(value)
     if not path.is_file():
@@ -772,7 +788,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     env = os.environ.get
     app = options()
-    app.add_argument("app", type=existing_path, help="a built .app")
+    app.add_argument("app", type=any_path, help="a built .app")
 
     identity = options()
     identity.add_argument(
@@ -797,7 +813,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     notary = options()
     notary.add_argument(
-        "--keychain-profile", help=f"credentials stored with setup (default: {DEFAULT_KEYCHAIN_PROFILE})"
+        "--keychain-profile",
+        help=f"credentials stored with setup (default: a stored API key, else {DEFAULT_KEYCHAIN_PROFILE})",
     )
     notary.add_argument(
         "--key",
@@ -835,7 +852,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub = add("sign", cmd_sign, "copy and sign an app", app, identity, entitlements, signing, dry)
     sub.add_argument("--release", action="store_true", help="sign with Developer ID rather than for development")
     sub = add("install", cmd_install, "development sign, then install", app, identity, entitlements, signing, dry)
-    sub.add_argument("--dir", type=any_path, default=Path("/Applications"), help="(default: %(default)s)")
+    sub.add_argument(
+        "--dir", type=any_path, default=Path("/Applications"), help="where to install (default: %(default)s)"
+    )
     add(
         "notarise",
         cmd_notarise,
